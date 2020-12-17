@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html>
+<head lang="en">
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0">
+    <title></title>
+    <link href="main.css" rel="stylesheet" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/2.0.3/socket.io.js"></script>
+    <script src="adapter-latest.js"></script>
+    <script src="graph.js"></script>
+</head>
+<body>
+  <div class="chat">
+    <input type="text" value="" id="txt">
+    <input type="button" value="发送" id="send">
+    <ul id="content"></ul>
+  </div>
+  <div class="room">
+    <div>
+      <button id="connserver">Connect Sig Server</button>
+      <button id="leave">Leave</button>      
+    </div>
+    <div>
+      <input id="shareDesk" type="checkbox"/><label for="shareDesk">Share Desktop</label>
+    </div>
+    <div>
+      <label>BandWidth:</label>
+      <select id="bandwidth" disabled>
+        <option value="unlimited" selected>unlimited</option>
+        <option value="2000">2000</option>
+        <option value="1000">1000</option>
+        <option value="500">500</option>
+        <option value="250">250</option>
+        <option value="125">125</option>
+      </select>
+      kbps
+    </div>
+    <div id="preview">
+      <div>
+        <h2>Local:</h2>
+        <video id="localvideo" autoplay playsinline muted></video>
+        <h2>Offer SDP:</h2>
+        <textarea id="offer"></textarea>
+      </div>
+      <div>
+        <h2>Remote:</h2>
+        <video id="remotevideo" autoplay playsinline></video>
+        <h2>Answer SDP:</h2>
+        <textarea id="answer"></textarea>
+      </div>
+      <div>
+        <h2>Chat:<h2>
+        <textarea id="chat" disabled></textarea>
+        <textarea id="sendtxt" disabled></textarea>
+        <button id="send" disabled>Send</button>
+      </div>
+    </div>
+
+    <div class="graph-container" id="bitrateGraph">
+      <div>Bitrate</div>
+      <canvas id="bitrateCanvas"></canvas>
+    </div>
+    <div class="graph-container" id="packetGraph">
+      <div>Packets sent per second</div>
+      <canvas id="packetCanvas"></canvas>
+    </div>
+  </div>
+<script>
+  // var socket = io('https://localhost')
+  // socket.on('message', function(data){
+  //   console.log(data)
+  //   var liEle = document.createElement('li')
+  //   liEle.innerHTML = data.msg
+  //   document.getElementById('content').appendChild(liEle)
+  // })
+
+  var btnConn = document.querySelector("#connserver")
+  var shareDeskBox = document.querySelector("#shareDesk")
+  var localVideo = document.querySelector('#localvideo')
+  var remoteVideo = document.querySelector("#remotevideo")
+  var btnLeave = document.querySelector('#leave')
+  var offer = document.querySelector("#offer")
+  var answer = document.querySelector("#answer")
+  var pc = null
+  var dc = null;
+  var localStream = null
+  var remoteStream = null
+  var socket = null
+  var offerdesc = null
+  var state = 'init'
+  var pcConfig = {
+    'iceServers': [
+      {
+        'urls': 'turn:stun.al.learningrtc.cn:3478',
+        'credential': 'mypasswd',
+        'username': 'garrylea'
+      },
+      // {
+      //   'urls': 'stun:stun.l.google.com:19302'
+      // },
+      // {
+      //   'urls': 'stun.xten.com:3478'
+      // },
+      // {
+      //   'urls': 'stun.voipbuster.com:3478'
+      // },
+      // {
+      //   'urls': 'stun.voxgratia.org:3478'
+      // },
+      // {
+      //   'urls': 'stun.sipgate.net:10000'
+      // }
+    ]
+  }
+
+  var optBw = document.querySelector('select#bandwidth')
+  var bitrateGraph
+  var bitrateSeries
+
+  var packetGraph
+  var packetSeries
+
+  var lastResult
+
+  var chat = document.querySelector('textarea#chat');
+  var send_txt = document.querySelector('textarea#sendtxt');
+  var send = document.querySelector('button#send');
+
+  btnConn.onclick = connSignalServer
+  btnLeave.onclick = leave
+  optBw.onchange = chang_bw
+  send.onclick = sendText;
+
+
+  function dataChannelStateChange() {
+    var readyState = dc.readyState;
+    console.log('Send channel state is: ' + readyState);
+    if (readyState === 'open') {
+      send_txt.disabled = false;
+      send.disabled = false;
+    } else {
+      send_txt.disabled = true;
+      send.disabled = true;
+    }
+  }
+
+  function chang_bw(){
+    optBw.disabled = true;
+    var bw = optBw.options[optBw.selectedIndex].value;
+
+    var vsender = null;
+    var senders = pc.getSenders();
+
+    senders.forEach( sender => {
+      if(sender && sender.track.kind === 'video'){
+        vsender = sender;	
+      }	
+    });
+
+    var parameters = vsender.getParameters();
+    if(!parameters.encodings){
+      return;	
+    }
+
+    if(bw === 'unlimited'){
+      return;	
+    }
+
+    parameters.encodings[0].maxBitrate = bw * 1000;
+
+    vsender.setParameters(parameters)
+      .then(()=>{
+        optBw.disabled = false;
+        console.log('Successed to set parameters!');
+      })
+      .catch(err => {
+        console.error(err);
+      })
+}
+
+  function leave () {
+    if (socket) {
+      socket.emit('leave', roomid)
+    }
+
+    dc.close();
+    dc = null;
+    send_txt.disabled = true;
+    send.disabled = true;
+    
+    hangup()
+    closeLocalMedia()
+    offer.value = ''
+    answer.value = ''
+    btnConn.disabled = false;
+    btnLeave.disabled = true;
+    optBw.disabled = true;
+  }
+
+  function connSignalServer () {
+    start()
+  }
+
+  function start () {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      console.log('not supported!')
+      return
+    } else {
+      var constraints;
+      if(shareDeskBox.checked && shareDesk()) {
+        constraints = {
+          video: false,
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        }
+      } else {
+        constraints = {
+          video: true,
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        }
+      }
+      navigator.mediaDevices.getUserMedia(constraints).then(getMediaStream).catch(handleError)
+    }
+  }
+
+  function shareDesk () {
+    if (IsPC()) {
+      navigator.mediaDevices.getDisplayMedia({video: true}).then(getDeskStream).catch(handleError)
+      return true
+    }
+    return false
+  }
+
+  function getDeskStream (stream) {
+    localStream = stream
+  }
+
+  function getMediaStream (stream) {
+    if (localStream) {
+      stream.getAudioTracks().forEach((track) => {
+        localStream.addTrack(track)
+        stream.removeTrack(track)
+      })
+    } else {
+      localStream = stream
+    }
+    localVideo.srcObject = localStream
+    conn()
+
+    bitrateSeries = new TimelineDataSeries();
+    bitrateGraph = new TimelineGraphView('bitrateGraph', 'bitrateCanvas');
+    bitrateGraph.updateEndDate();
+
+    packetSeries = new TimelineDataSeries();
+    packetGraph = new TimelineGraphView('packetGraph', 'packetCanvas');
+    packetGraph.updateEndDate();
+  }
+
+  function conn () {
+    socket = io.connect()
+    socket.on('joined', (roomid, id) => {
+      console.log('receive joined message!', roomid, id)
+      state = 'joined'
+      createPeerConnection()
+      bindTracks()
+      btnConn.disabled = true
+      btnLeave.disabled = false
+      console.log('receive joined message, state=', state)
+    })
+    socket.on('otherjoin', (roomid) => {
+      console.log('receive joined message:', roomid, state)
+      if (state === 'joined_unbind') {
+        createPeerConnection()
+        bindTracks()
+      }
+
+      //create data channel for transporting non-audio/video data
+      dc = pc.createDataChannel('chatchannel');
+      dc.onmessage = receivemsg;
+      dc.onopen = dataChannelStateChange;
+      dc.onclose = dataChannelStateChange;
+
+      state = 'joined_conn'
+      call()
+      console.log('receive other_join message, state=', state);
+    })
+    socket.on('full', (roomid, id) => {
+      console.log('receive full message', roomid, id)
+      hangup()
+      closeLocalMedia()
+      state = 'leave'
+      console.log('receive full message, state=', state)
+      alert('the room is full!');
+    })
+    socket.on('leave', (roomid, id) => {
+      console.log('receive leaved message', roomid, id);
+      state='leaved'
+      socket.disconnect();
+      console.log('receive leaved message, state=', state);
+      btnConn.disabled = false;
+      btnLeave.disabled = true;
+      optBw.disabled = true;
+    })
+    socket.on('bye', (roomid, id) => {
+      console.log('receive bye message', roomid, id);
+      state = 'joined_unbind'
+      hangup()
+      offer.value = ''
+      answer.value = ''
+      console.log('receive bye message, state=', state);
+    })
+    socket.on('disconnect', (socket) => {
+      console.log('receive disconnect message!', roomid)
+      if (!(state === 'leave')) {
+        hangup()
+        closeLocalMedia()
+      }
+      state = 'leaved'
+      btnConn.disabled = false;
+      btnLeave.disabled = true;
+      optBw.disabled = true;
+    })
+    socket.on('message', (roomid, data) => {
+      console.log('receive message!', roomid, data)
+      var liEle = document.createElement('li')
+      liEle.innerHTML = data.msg
+      console.log(data)
+      if(data.msg){
+        document.getElementById('content').appendChild(liEle)
+      }
+      if (data === null || data === undefined) {
+        console.error('the message is invalid!')
+			  return
+      }
+      if (data.hasOwnProperty('type') && data.type === 'offer') {
+        offer.value = data.sdp
+        pc.setRemoteDescription(new RTCSessionDescription(data))
+        pc.createAnswer().then(getAnswer).catch(handleAnswerError)
+      } else if (data.hasOwnProperty('type') && data.type === 'answer') {
+        optBw.disabled = false
+        answer.value = data.sdp
+        pc.setRemoteDescription(new RTCSessionDescription(data))
+      } else if (data.hasOwnProperty('type') && data.type === 'candidate') {
+        var candidate = new RTCIceCandidate({
+          sdpMLineIndex: data.label,
+          candidate: data.candidate
+        })
+        pc.addIceCandidate(candidate)
+      } else {
+        console.log('the message is invalid!', data);
+      }
+     
+    })
+    
+
+    // roomid = getQueryVariable('room')
+    roomid = 'room1'
+    socket.emit('join', roomid)
+
+    document.getElementById('send').addEventListener('click', function(e){
+      console.log(1111)
+      socket.emit('message', roomid, {msg: document.getElementById('txt').value})
+    })
+    return true
+  }
+
+  function getAnswer (desc) {
+    pc.setLocalDescription(desc)
+    answer.value = desc.sdp
+    sendMessage(roomid, desc)
+    optBw.disabled = false;
+  }
+  
+  function handleAnswerError(err){
+    console.error('Failed to create answer:', err);
+  }
+
+  function hangup () {
+    if (pc) {
+      offerdesc = null
+      pc.close()
+      pc = null
+    }
+  }
+
+  function closeLocalMedia () {
+    if (localStream && localStream.getTracks()) {
+      localStream.getTracks().forEach((track) => {
+        track.stop()
+      })
+    }
+    localStream = null
+  }
+
+  function call () {
+    if (state == 'joined_conn') {
+      var offerOptions = {
+        offerToRecieveAudio: 1,
+        offerToRecieveVideo: 1
+      }
+      pc.createOffer(offerOptions).then(getOffer).catch(handleOfferError)
+    }
+  }
+
+  function receivemsg(e){
+    var msg = e.data;
+    if(msg){
+      console.log(msg);
+      chat.value += "->" + msg + "\r\n";
+    }else{
+      console.error('received msg is null');
+    }
+  }
+
+  function getOffer (desc) {
+    pc.setLocalDescription(desc)
+    offer.value = desc.sdp
+    offerdesc = desc
+    sendMessage(roomid, offerdesc)
+  }
+
+  function handleOfferError () {
+    console.error('Failed to create offer:', err);
+  }
+
+  function createPeerConnection () {
+    console.log('create RTCPeerConnection!')
+    if (!pc) {
+      pc = new RTCPeerConnection(pcConfig)
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          sendMessage(roomid, {
+            type: 'candidate',
+            label: event.candidate.sdpMLineIndex,
+            id: event.candidate.sdpMid,
+            candidate: event.candidate.candidate
+          })
+        } else {
+          console.log('this is the end candidate')
+        }
+      }
+
+      pc.ondatachannel = e=> {
+        if(!dc){
+          dc = e.channel;
+          dc.onmessage = receivemsg; 
+          dc.onopen = dataChannelStateChange;
+          dc.onclose = dataChannelStateChange;
+        }
+      }
+
+      pc.ontrack = getRemoteStream
+    } else {
+      console.warning('the pc have be created!');
+    }
+    return
+  }
+
+  function bindTracks () {
+    console.log('bind tracks into RTCPeerConnection!')
+    if (pc === null || pc === undefined) {
+      console.error('pc is null or undefined!')
+		  return
+    }
+    if (localStream === null || localStream === undefined) {
+      console.error('localstream is null or undefined!');
+		  return;
+    }
+    localStream.getTracks().forEach(track => {
+      pc.addTrack(track, localStream)
+    })
+  }
+
+  function sendMessage(roomid, data){
+    console.log('send message to other end', roomid, data);
+    if (!socket) {
+      console.log('socket is null');
+    }
+    socket.emit('message', roomid, data)
+  }
+
+  function getRemoteStream (e) {
+    remoteStream = e.streams[0]
+    remoteVideo.srcObject = e.streams[0]
+  }
+
+  function handleError (err) {
+    console.error('Failed to get Media Stream!', err);
+  }
+
+  function IsPC() {
+    var userAgentInfo = navigator.userAgent;
+    var Agents = ["Android", "iPhone","SymbianOS", "Windows Phone","iPad", "iPod"];
+    var flag = true;
+
+    for (var v = 0; v < Agents.length; v++) {
+      if (userAgentInfo.indexOf(Agents[v]) > 0) {
+        flag = false;
+        break;
+      }
+    }
+
+    return flag;
+  }
+
+  //获取url参数
+  function getQueryVariable (variable) {
+    var query = window.location.search.substring(1);
+    var vars = query.split("&");
+    for (var i=0;i<vars.length;i++) {
+            var pair = vars[i].split("=");
+            if(pair[0] == variable){return pair[1];}
+    }
+    return(false);
+  }
+
+// query getStats every second
+window.setInterval(() => {
+  if (!pc) {
+    return;
+  }
+  const sender = pc.getSenders()[0];
+  if (!sender) {
+    return;
+  }
+  sender.getStats().then(res => {
+    res.forEach(report => {
+      let bytes;
+      let packets;
+      if (report.type === 'outbound-rtp') {
+        if (report.isRemote) {
+          return;
+        }
+        const now = report.timestamp;
+        bytes = report.bytesSent;
+        packets = report.packetsSent;
+        if (lastResult && lastResult.has(report.id)) {
+          // calculate bitrate
+          const bitrate = 8 * (bytes - lastResult.get(report.id).bytesSent) /
+            (now - lastResult.get(report.id).timestamp);
+
+          // append to chart
+          bitrateSeries.addPoint(now, bitrate);
+          bitrateGraph.setDataSeries([bitrateSeries]);
+          bitrateGraph.updateEndDate();
+
+          // calculate number of packets and append to chart
+          packetSeries.addPoint(now, packets -
+            lastResult.get(report.id).packetsSent);
+          packetGraph.setDataSeries([packetSeries]);
+          packetGraph.updateEndDate();
+        }
+      }
+    });
+    lastResult = res;
+  });
+}, 1000);
+
+function sendText(){
+	var data = send_txt.value;
+	if(data != null){
+		dc.send(data);
+	}
+
+	//更好的展示
+	send_txt.value = "";
+	chat.value += '<- ' + data + '\r\n';
+}
+
+</script>
+</body>
+</html>
